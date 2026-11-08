@@ -695,7 +695,6 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(subsets, [2])
 
     @torch._inductor.config.patch(
-        strict_output_strides=True,
         post_grad_fusion_options={
             "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
         },
@@ -826,7 +825,6 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(subsets, [3])
 
     @torch._inductor.config.patch(
-        strict_output_strides=True,
         post_grad_fusion_options={
             "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
         },
@@ -855,6 +853,7 @@ class TestGroupBatchFusion(TestCase):
                 actual = torch.compile(module, fullgraph=True)(x)
         self.assertEqual(actual, expected)
         self.assertEqual(actual[0].stride(), expected[0].stride())
+        self.assertEqual(actual[0].view(-1), expected[0].view(-1))
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [3])
 
@@ -944,6 +943,62 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(actual[0].stride(), expected[0].stride())
         self.assertEqual(actual[0].stride(), (1, 16))
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+
+    @torch._inductor.config.patch(
+        post_grad_fusion_options={
+            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
+        },
+    )
+    def test_batch_linear_lhs_post_grad_as_strided(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = torch.nn.Linear(64, 16, bias=False)
+                self.a = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                return (
+                    torch.sin(self.q(x).as_strided((32, 16), (16, 1))),
+                    torch.cos(self.a(x)),
+                )
+
+        counters.clear()
+        module = M().eval()
+        x = torch.randn(32, 64)
+        with torch.no_grad():
+            expected = module(x)
+            actual = torch.compile(module, fullgraph=True)(x)
+        self.assertEqual(actual, expected)
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+
+    def test_batch_linear_lhs_match_ignores_mm_dtype(self):
+        from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
+
+        graph = torch.fx.Graph()
+        input = graph.placeholder("input")
+        weight = graph.placeholder("weight")
+        input.meta["val"] = torch.randn(4, 8)
+        weight.meta["val"] = torch.randn(8, 6)
+        mm = graph.call_function(
+            torch.ops.aten.mm.dtype,
+            args=(input, weight),
+            kwargs={"out_dtype": torch.float32},
+        )
+        mm.meta["val"] = torch.randn(4, 6)
+        self.assertIsNone(BatchLinearLHSFusion().match(mm))
+
+    def test_batch_linear_lhs_stage_config_migration(self):
+        from torch._inductor.fx_passes.group_batch_fusion import (
+            generate_fusion_from_config,
+        )
+
+        self.assertEqual(
+            generate_fusion_from_config({"batch_linear_lhs": {}}, pre_grad=True), []
+        )
+        self.assertEqual(
+            len(generate_fusion_from_config({"batch_linear_lhs": {}}, pre_grad=False)),
+            1,
+        )
 
     @parametrize("consumer", ["custom_contiguous", "merge_view"])
     @torch._inductor.config.patch(
