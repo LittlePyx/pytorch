@@ -522,9 +522,11 @@ class BatchLinearLHSFusion(BatchFusion):
     """
 
     def _addmm_node_can_be_fused(self, node: torch.fx.Node) -> bool:
+        # pyre-fixme[7]: Incompatible return type
         return (
+            # pyrefly: ignore [bad-return]
             node.kwargs.get("beta", DEFAULT_BETA) == DEFAULT_BETA
-            and node.kwargs.get("alpha", DEFAULT_ALPHA) == DEFAULT_ALPHA
+            and node.kwargs.get("alpha", DEFAULT_ALPHA) == DEFAULT_ALPHA  # type: ignore[return-value]
         )
 
     def _is_input_2d(self, node: torch.fx.Node) -> bool:
@@ -550,6 +552,8 @@ class BatchLinearLHSFusion(BatchFusion):
         if not statically_known_true(weight_val.shape[1] > 0):
             return None
         if bias_m is not None:
+            if not isinstance(bias_m, torch.fx.Node):
+                return None
             bias_val = bias_m.meta["val"]
             if not (
                 isinstance(bias_val, torch.Tensor)
