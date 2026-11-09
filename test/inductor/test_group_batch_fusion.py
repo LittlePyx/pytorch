@@ -858,6 +858,40 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [3])
 
+    @torch._inductor.config.patch(
+        post_grad_fusion_options={
+            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
+        },
+    )
+    def test_batch_linear_lhs_materializes_output_views(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.large = torch.nn.Linear(64, 48, bias=False)
+                self.a = torch.nn.Linear(64, 16, bias=False)
+                self.b = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                return (
+                    self.large(x).unsqueeze(0),
+                    torch.sin(self.a(x)),
+                    torch.cos(self.b(x)),
+                )
+
+        counters.clear()
+        module = M().eval()
+        x = torch.randn(32, 64)
+        with torch.no_grad():
+            expected = module(x)
+            with _record_fusion_subsets() as subsets:
+                actual = torch.compile(module, fullgraph=True)(x)
+        self.assertEqual(actual, expected)
+        # A view of the projection returned as output must still be contiguous.
+        self.assertEqual(actual[0].stride(), expected[0].stride())
+        self.assertEqual(actual[0].view(-1), expected[0].view(-1))
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+        self.assertEqual(subsets, [3])
+
     def test_batch_linear_lhs_post_grad_strided_meta(self):
         from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
 

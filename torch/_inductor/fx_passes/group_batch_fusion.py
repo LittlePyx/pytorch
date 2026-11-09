@@ -12,6 +12,7 @@ from torch._logging import trace_structured
 from torch.fx.experimental.symbolic_shapes import free_symbols, statically_known_true
 from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.graph_transform_observer import GraphTransformObserver
+from torch.fx.passes.reinplace import _is_view_op
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config
@@ -533,6 +534,35 @@ class BatchLinearLHSFusion(BatchFusion):
         value = node.meta.get("val", node.meta.get("example_value"))
         return value is not None and len(value.shape) == 2
 
+    @staticmethod
+    def _reaches_user_visible_output(
+        node: torch.fx.Node, graph: torch.fx.Graph
+    ) -> bool:
+        output_node = next(n for n in graph.nodes if n.op == "output")
+        args = output_node.args[0]
+        if not isinstance(args, (tuple, list)):
+            args = (args,)
+        visible_idxs = output_node.meta.get("user_visible_output_idxs")
+        if visible_idxs is None:
+            visible = {arg for arg in args if isinstance(arg, torch.fx.Node)}
+        else:
+            visible = {
+                args[i]
+                for i in visible_idxs
+                if i < len(args) and isinstance(args[i], torch.fx.Node)
+            }
+        pending = [node]
+        seen = OrderedSet([node])
+        while pending:
+            cur = pending.pop()
+            for user in cur.users:
+                if user.op == "output" and cur in visible:
+                    return True
+                if _is_view_op(user.target) and user not in seen:
+                    seen.add(user)
+                    pending.append(user)
+        return False
+
     def match(self, node: torch.fx.Node):
         if CallFunctionVarArgs(aten.mm.default).match(node):
             input_m, weight_m = node.args
@@ -654,11 +684,11 @@ class BatchLinearLHSFusion(BatchFusion):
                 getitem.meta["example_value"] = split_values[i]
 
             new_node = getitem
-            if any(user.op == "output" for user in node.users):
-                # A direct graph output is user-visible: eager returns a
-                # contiguous tensor with independent storage. Materialize this
-                # slice so its stride and aliasing match eager. Other consumers
-                # keep the honest strided slice and lowering copies on demand.
+            if self._reaches_user_visible_output(node, graph):
+                # A user-visible output, possibly through a view chain, must
+                # keep eager strides and own storage. Lowering only enforces
+                # stride order for views and would accept the wide row stride,
+                # so materialize the slice here.
                 with graph.inserting_after(getitem):  # type: ignore[operator]
                     new_node = graph.call_function(  # type: ignore[operator]
                         aten.clone.default,
