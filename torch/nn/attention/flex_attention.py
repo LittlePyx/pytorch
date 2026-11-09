@@ -326,12 +326,15 @@ class FlexKernelOptions(TypedDict, total=False):
     Raises an error if the requested forward backend cannot be used. Default: "AUTO"
     """
 
-    HELION_AUTOTUNE_EFFORT: NotRequired[Literal["none", "quick", "full"]]
-    """Helion autotuning effort with ``BACKEND="HELION"``.
+    HELION_AUTOTUNE_TOLERANCE: NotRequired[float]
+    """Autotuning accuracy tolerance with ``BACKEND="HELION"``.
 
-    "none" uses a pretuned config for the call's shape class, or Helion's default
-    config; "quick" and "full" autotune the Helion kernels when compiling (minutes
-    per kernel; Helion caches the result on disk). Default: "none"
+    The Helion kernels autotune when compiling, at Helion's autotune effort (the
+    ``HELION_AUTOTUNE_EFFORT`` environment variable: "full" by default, minutes
+    per kernel; "none" skips autotuning). Helion caches tuned configs on disk.
+    A candidate config is accepted when each output element is within this
+    fraction of the output's peak magnitude of Helion's default config.
+    Default: 0.02
     """
 
 

@@ -105,6 +105,25 @@ CASES = [
 class TestFlexHelion(InductorTestCase):
     hw_classification = HardwareClassification.CUDA
 
+    @classmethod
+    def setUpClass(cls):
+        # A real autotune takes minutes per kernel: run Helion's default
+        # configs (test_autotunes covers the autotuning path).
+        from torch._inductor.kernel.flex import flex_helion_kernels
+
+        super().setUpClass()
+        cls._effort = mock.patch.dict(os.environ, {"HELION_AUTOTUNE_EFFORT": "none"})
+        cls._effort.start()
+        flex_helion_kernels._kernel.cache_clear()
+
+    @classmethod
+    def tearDownClass(cls):
+        from torch._inductor.kernel.flex import flex_helion_kernels
+
+        cls._effort.stop()
+        flex_helion_kernels._kernel.cache_clear()
+        super().tearDownClass()
+
     def setUp(self):
         super().setUp()
         torch.manual_seed(0)
@@ -225,52 +244,10 @@ class TestFlexHelion(InductorTestCase):
         self.assertEqual(compile_counts["TRITON"].frame_count, 1)
         self.assertEqual(compile_counts["HELION"].frame_count, 2)
 
-    def test_pretuned_configs_apply(self):
-        # Each pretuned config is valid for the installed Helion (a stale one
-        # would silently fall back to Helion's default config).
-        from torch._inductor.kernel.flex import flex_helion_kernels
-
-        pretuned = flex_helion_attention._PRETUNED_SM100
-        self.assertTrue(pretuned)
-        mask = create_block_mask(_causal, None, None, 256, 256, device="cuda")
-        for d in sorted({dim for _, dim, _ in pretuned}):
-            torch._dynamo.reset()
-            q, k, v = _tensors(2, 4, 4, 256, 256, d)
-            with mock.patch.object(
-                flex_helion_kernels, "get_kernel", wraps=flex_helion_kernels.get_kernel
-            ) as get_kernel:
-                out = torch.compile(flex_attention)(
-                    q, k, v, block_mask=mask, kernel_options=HELION
-                )
-                out.sum().backward()
-            for direction in ("forward", "backward"):
-                config = pretuned.get((direction, d, d))
-                if config is not None:
-                    self.assertIn(
-                        mock.call(direction, config=config),
-                        get_kernel.call_args_list,
-                        f"pretuned {direction} config for head dim {d} was not used",
-                    )
-
-    def test_stale_pretuned_config_falls_back(self):
-        from torch._inductor.kernel.flex import flex_helion_kernels
-
-        q, k, v = _tensors(2, 4, 4, 256, 256, 64, requires_grad=False)
-        stale = {("forward", 64, 64): {"not_a_helion_config_key": 1}}
-        with (
-            mock.patch.dict(flex_helion_attention._PRETUNED_SM100, stale),
-            mock.patch.object(
-                flex_helion_kernels, "get_kernel", wraps=flex_helion_kernels.get_kernel
-            ) as get_kernel,
-        ):
-            out = torch.compile(flex_attention)(q, k, v, kernel_options=HELION)
-        self.assertTrue(out.isfinite().all())
-        for call in get_kernel.call_args_list:
-            self.assertIsNone(call.kwargs.get("config"))
-
-    def test_autotune_opt_in(self):
-        # HELION_AUTOTUNE_EFFORT autotunes on real inputs, with dense (every
-        # block full) BlockMask tables, and lowers the config it finds.
+    def test_autotunes(self):
+        # The kernels autotune at Helion's effort on real inputs, with dense
+        # (every block full) BlockMask tables, accept configs within
+        # HELION_AUTOTUNE_TOLERANCE, and lower the config autotuning finds.
         from helion.runtime.kernel import Kernel
 
         from torch._inductor.kernel.flex import flex_helion_kernels
@@ -282,6 +259,8 @@ class TestFlexHelion(InductorTestCase):
         def autotune(kernel, args, force):
             self.assertFalse(force)
             self.assertEqual(kernel.settings.autotune_effort, "quick")
+            check = kernel.settings.autotune_baseline_accuracy_check_fn
+            self.assertEqual(check.keywords, {"tolerance": 0.05})
             names = list(kernel.signature.parameters)
             table = dict(zip(names, args))
             self.assertNotIsInstance(table["query"], torch._subclasses.FakeTensor)
@@ -291,7 +270,10 @@ class TestFlexHelion(InductorTestCase):
             found["config"] = kernel.bind(args).config_spec.default_config()
             return found["config"]
 
+        flex_helion_kernels._kernel.cache_clear()
+        self.addCleanup(flex_helion_kernels._kernel.cache_clear)
         with (
+            mock.patch.dict(os.environ, {"HELION_AUTOTUNE_EFFORT": "quick"}),
             mock.patch.object(Kernel, "autotune", autospec=True) as kernel_autotune,
             mock.patch.object(
                 flex_helion_kernels, "get_kernel", wraps=flex_helion_kernels.get_kernel
@@ -303,7 +285,7 @@ class TestFlexHelion(InductorTestCase):
                 k,
                 v,
                 block_mask=mask,
-                kernel_options={**HELION, "HELION_AUTOTUNE_EFFORT": "quick"},
+                kernel_options={**HELION, "HELION_AUTOTUNE_TOLERANCE": 0.05},
             )
         self.assertTrue(out.isfinite().all())
         self.assertEqual(kernel_autotune.call_count, 1)
@@ -341,11 +323,11 @@ class TestFlexHelion(InductorTestCase):
                 [(n.op, n.target) for n in gm.graph.nodes],
             )
 
-    def test_rejects_invalid_autotune_effort(self):
+    def test_rejects_invalid_autotune_tolerance(self):
         q, k, v = _tensors(2, 4, 4, 256, 256, 64, requires_grad=False)
-        with self.assertRaisesRegex(Exception, "Invalid HELION_AUTOTUNE_EFFORT 'max'"):
+        with self.assertRaisesRegex(Exception, "Invalid HELION_AUTOTUNE_TOLERANCE -1"):
             torch.compile(flex_attention)(
-                q, k, v, kernel_options={**HELION, "HELION_AUTOTUNE_EFFORT": "max"}
+                q, k, v, kernel_options={**HELION, "HELION_AUTOTUNE_TOLERANCE": -1}
             )
 
     def test_rejects_float32(self):

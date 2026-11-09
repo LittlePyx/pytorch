@@ -322,15 +322,19 @@ def flex_attention_backward(
     return dq, dk, dv
 
 
-def _accuracy_check(actual: object, expected: object) -> None:
-    """Autotuning accuracy check: every element's difference is bounded by 2%
-    of the output's peak (bf16 outputs carry rounding error proportional to
-    each output's peak, and gradient tensors are heavy-tailed, so the default
-    absolute tolerance rejects correct configs)."""
+# Default for kernel_options HELION_AUTOTUNE_TOLERANCE (see _accuracy_check).
+AUTOTUNE_TOLERANCE = 2e-2
+
+
+def _accuracy_check(actual: object, expected: object, *, tolerance: float) -> None:
+    """Autotuning accuracy check: every element's difference is bounded by
+    ``tolerance`` times the output's peak (bf16 outputs carry rounding error
+    proportional to each output's peak, and gradient tensors are heavy-tailed,
+    so the default absolute tolerance rejects correct configs)."""
     for got, ref in zip(actual, expected, strict=True):  # type: ignore[call-overload]
         ref = ref.float()
         peak = ref.abs().max().item()
-        torch.testing.assert_close(got.float(), ref, atol=2e-2 * peak, rtol=0.0)
+        torch.testing.assert_close(got.float(), ref, atol=tolerance * peak, rtol=0.0)
 
 
 _FUNCTIONS: dict[str, Callable[..., Any]] = {
@@ -340,8 +344,9 @@ _FUNCTIONS: dict[str, Callable[..., Any]] = {
 
 
 @functools.cache
-def _kernel(direction: str, autotune_effort: str, config_json: str | None):
+def _kernel(direction: str, tolerance: float, config_json: str | None):
     config = None if config_json is None else helion.Config(**json.loads(config_json))
+    # The autotune effort is Helion's own setting (HELION_AUTOTUNE_EFFORT).
     return helion.kernel(
         _FUNCTIONS[direction],
         backend="cute",
@@ -349,20 +354,22 @@ def _kernel(direction: str, autotune_effort: str, config_json: str | None):
         # fast_math: the CuTe flash kernels' polynomial exp2 packets and
         # tanh.approx (the same approximation class as FlashAttention-4).
         fast_math=True,
-        autotune_effort=autotune_effort,
         config=config,
-        autotune_baseline_accuracy_check_fn=_accuracy_check,
+        autotune_baseline_accuracy_check_fn=functools.partial(
+            _accuracy_check, tolerance=tolerance
+        ),
     )
 
 
 def get_kernel(
     direction: str,
     *,
-    autotune_effort: str = "none",
+    tolerance: float = AUTOTUNE_TOLERANCE,
     config: dict[str, Any] | None = None,
 ):
     """The ``direction`` ("forward" / "backward") kernel: with ``config``, a
-    kernel fixed to it; otherwise one that autotunes at ``autotune_effort``
-    ("none" takes Helion's default config)."""
+    kernel fixed to it; otherwise one that autotunes at Helion's autotune
+    effort, accepting configs within ``tolerance`` (see ``_accuracy_check``) of
+    Helion's default config."""
     config_json = None if config is None else json.dumps(config, sort_keys=True)
-    return _kernel(direction, autotune_effort, config_json)
+    return _kernel(direction, tolerance, config_json)

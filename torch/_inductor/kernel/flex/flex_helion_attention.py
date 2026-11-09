@@ -7,9 +7,10 @@ compiled with Helion's CuTe backend into its fused tcgen05 flash kernels
 as FX GraphModules, which Helion inlines at trace time; Helion lowers each kernel
 call through its own Inductor template lowering.
 
-Configs: by default a call takes the pretuned config of its shape class
-(``_PRETUNED_SM100``), or Helion's default config; ``kernel_options``
-``HELION_AUTOTUNE_EFFORT`` ("quick" / "full") opts into autotuning instead.
+Configs: each kernel autotunes when compiled, at Helion's autotune effort
+(``HELION_AUTOTUNE_EFFORT``; "none" takes Helion's default config), accepting
+configs within ``kernel_options`` ``HELION_AUTOTUNE_TOLERANCE`` of the default
+config. Helion caches tuned configs on disk.
 
 The kernels are compiled for static shapes: the lowering specializes the graph
 to its inputs' sizes, so a call at another shape recompiles.
@@ -52,91 +53,9 @@ if TYPE_CHECKING:
 aten = torch.ops.aten
 prims = torch.ops.prims
 
-_AUTOTUNE_EFFORTS = ("none", "quick", "full")
 # The fused kernels walk 128-wide KV blocks; "no BlockMask" (the frontend's one
 # _LARGE_SPARSE_BLOCK_SIZE block) becomes dense tables of this block size.
 _DENSE_BLOCK_SIZE = 128
-
-# Pretuned B200 (sm100) configs by (direction, head dim, V head dim), tuned
-# with HELION_AUTOTUNE_EFFORT=quick on causal bf16 B=4 H=16 S=8192 (1.15-1.3x
-# over Helion's default config there). Each lists the knobs that differ from
-# Helion's default config; Helion fills in the rest.
-_PRETUNED_SM100: dict[tuple[str, int, int], dict[str, Any]] = {
-    ("forward", 64, 64): {
-        "block_sizes": [128, 128],
-        "cute_flash_corr_regs": 80,
-        "cute_flash_disc_pipe": 1,
-        "cute_flash_e2e_offset": 5,
-        "cute_flash_e2e_offset0": 9,
-        "cute_flash_e2e_schedule": "16/2",
-        "cute_flash_epi_stg": False,
-        "cute_flash_epi_tma": True,
-        "cute_flash_exp2_packet": "8x1",
-        "cute_flash_first_load_order": 4,
-        "cute_flash_flex_early_qk": False,
-        "cute_flash_flex_hook_fast_full": True,
-        "cute_flash_kv_stage": 2,
-        "cute_flash_other_regs": 32,
-        "cute_flash_persistent": False,
-        "cute_flash_s_load_rep": 16,
-        "cute_flash_softmax_region": "shared",
-        "cute_flash_softmax_regs": 168,
-        "cute_flash_split_p_arrive": True,
-    },
-    ("forward", 128, 128): {
-        "block_sizes": [128, 128],
-        "cute_flash_corr_regs": 80,
-        "cute_flash_corr_tile_size": 8,
-        "cute_flash_disc_pipe": 1,
-        "cute_flash_e2e_offset": 2,
-        "cute_flash_e2e_offset0": 3,
-        "cute_flash_e2e_schedule": "16/2",
-        "cute_flash_exp2_packet": "4x2",
-        "cute_flash_flex_early_qk": False,
-        "cute_flash_flex_hook_fast_full": True,
-        "cute_flash_o_stage": 1,
-        "cute_flash_other_regs": 32,
-        "cute_flash_persistent": False,
-        "cute_flash_rescale_chunk_cols": 32,
-        "cute_flash_s_load_rep": 16,
-        "cute_flash_softmax_region": "shared",
-        "cute_flash_softmax_regs": 168,
-    },
-    ("backward", 64, 64): {
-        "block_sizes": [128, 128],
-        "cute_flash_bwd_ds_tmem": 1,
-        "cute_flash_bwd_exp2_emu": 4,
-        "cute_flash_bwd_exp2_f32": 1,
-        "cute_flash_bwd_hook_cols": 32,
-        "cute_flash_bwd_hook_pin": 0,
-        "cute_flash_bwd_kv_stage": 1,
-        "cute_flash_bwd_mask_form": "bitmask",
-        "cute_flash_bwd_persistent": 1,
-        "cute_flash_bwd_regs": "152/136/88",
-        "cute_flash_bwd_s_first": "auto",
-        "cute_flash_bwd_stats_mma": 1,
-        "cute_flash_bwd_tile_group": 4,
-        "cute_flash_bwd_two_cta": 0,
-        "cute_min_blocks_per_mp": 1,
-        "cute_pdl": False,
-    },
-    ("backward", 128, 128): {
-        "block_sizes": [128, 128],
-        "cute_flash_bwd_exp2_emu": 4,
-        "cute_flash_bwd_exp2_f32": 1,
-        "cute_flash_bwd_hook_cols": 32,
-        "cute_flash_bwd_hook_pin": 0,
-        "cute_flash_bwd_mask_form": "element",
-        "cute_flash_bwd_persistent": 0,
-        "cute_flash_bwd_regs": "88/168/88",
-        "cute_flash_bwd_s_first": "auto",
-        "cute_flash_bwd_stats_mma": 0,
-        "cute_flash_bwd_tile_group": 2,
-        "cute_flash_bwd_two_cta": 1,
-        "cute_min_blocks_per_mp": 0,
-        "cute_pdl": False,
-    },
-}
 
 
 @functools.lru_cache(maxsize=1)
@@ -144,8 +63,9 @@ def ensure_helion_available() -> bool:
     """Whether helion and the CuTe DSL (nvidia-cutlass-dsl) its CuTe backend
     compiles with are importable; cached."""
     # TODO: require the first Helion release after 1.5.2. 1.5.2 and older miss
-    # flex fixes the pretuned configs rely on (pytorch/helion#4296, #4298,
-    # #4319, #4320); without them some score/mask mods compile to wrong results.
+    # flex fixes these kernels rely on (pytorch/helion#4296, #4298, #4319,
+    # #4320, #4365, #4369); without them some score/mask mods compile to wrong
+    # results under configs autotuning can pick, and max_scores cannot fuse.
     try:
         return all(
             importlib.util.find_spec(m) is not None for m in ("helion", "cutlass")
@@ -472,22 +392,24 @@ def _select_kernel(
     kernel_options: dict[str, Any],
     fake_args: tuple[object, ...],
     tuning_args: Callable[[], tuple[object, ...]],
-    head_dims: tuple[int, int],
 ) -> Any:
-    """The kernel to lower: fixed to a pretuned config, Helion's default
-    config, or (``HELION_AUTOTUNE_EFFORT``) the best config autotuning finds."""
-    import helion  # type: ignore[import-not-found]
-
+    """The kernel to lower, fixed to the best config autotuning finds (Helion's
+    default config at ``HELION_AUTOTUNE_EFFORT=none``)."""
     from . import flex_helion_kernels
 
-    effort = kernel_options.get("HELION_AUTOTUNE_EFFORT", "none")
-    if effort not in _AUTOTUNE_EFFORTS:
+    tolerance = kernel_options.get(
+        "HELION_AUTOTUNE_TOLERANCE", flex_helion_kernels.AUTOTUNE_TOLERANCE
+    )
+    if (
+        isinstance(tolerance, bool)
+        or not isinstance(tolerance, (int, float))
+        or not tolerance > 0
+    ):
         raise ValueError(
-            f"Invalid HELION_AUTOTUNE_EFFORT {effort!r}; must be one of "
-            f"{_AUTOTUNE_EFFORTS}"
+            f"Invalid HELION_AUTOTUNE_TOLERANCE {tolerance!r}; must be a positive number"
         )
-    default = flex_helion_kernels.get_kernel(direction)
-    bound = default._bind_isolated(fake_args)
+    kernel = flex_helion_kernels.get_kernel(direction, tolerance=float(tolerance))
+    bound = kernel._bind_isolated(fake_args)
     knob = "cute_flash_flex_" if direction == "forward" else "cute_flash_bwd_"
     if not any(k.startswith(knob) for k in bound.config_spec.default_config().config):
         matcher = "flex_match" if direction == "forward" else "flex_bwd_match"
@@ -497,19 +419,10 @@ def _select_kernel(
             "mask_mod pointwise in the coordinates and captured tensors); "
             f"HELION_LOGS=+helion._compiler.cute.{matcher} logs why"
         )
-    if effort != "none":
-        tuned = flex_helion_kernels.get_kernel(direction, autotune_effort=effort)
-        config = tuned.autotune(tuning_args(), force=False)
-        return flex_helion_kernels.get_kernel(direction, config=dict(config.config))
-    config = _PRETUNED_SM100.get((direction, *head_dims))
-    if config is None:
-        return default
-    try:
-        bound.config_spec.normalized_config(config)
-    except helion.exc.InvalidConfig:
-        # Tuned under another Helion version: take the default config.
-        return default
-    return flex_helion_kernels.get_kernel(direction, config=config)
+    if kernel.settings.autotune_effort == "none":
+        return kernel
+    config = kernel.autotune(tuning_args(), force=False)
+    return flex_helion_kernels.get_kernel(direction, config=dict(config.config))
 
 
 def _lower(
@@ -518,7 +431,6 @@ def _lower(
     tensor_args: dict[str, TensorBox],
     constant_args: dict[str, object],
     tables: Sequence[TensorBox],
-    head_dims: tuple[int, int],
 ) -> tuple[TensorBox, ...]:
     """Lower one kernel call through Helion's Inductor template lowering."""
     from helion._compiler._dynamo.higher_order_ops import (  # type: ignore[import-not-found]
@@ -547,19 +459,13 @@ def _lower(
 
         return _kernel_args(signature_kernel, tensor_args, constant_args, leaf)
 
-    kernel = _select_kernel(
-        direction, kernel_options, fake_args, tuning_args, head_dims
-    )
+    kernel = _select_kernel(direction, kernel_options, fake_args, tuning_args)
     return lower_helion_kernel(
         kernel_idx=helion_kernel_side_table.add_kernel(kernel),
         constant_args=constant_args,
         tensor_args=tensor_args,
         output_spec=infer_output_spec(kernel, fake_args),
     )
-
-
-def _head_dims(query: TensorBox, value: TensorBox) -> tuple[int, int]:
-    return int(query.get_size()[-1]), int(value.get_size()[-1])
 
 
 def create_flex_helion_attention_kernel(
@@ -620,7 +526,6 @@ def create_flex_helion_attention_kernel(
         tensor_args,
         constant_args,
         tables,
-        _head_dims(query, value),
     )
     return out, lse, max_scores
 
@@ -706,7 +611,6 @@ def create_flex_helion_attention_backward_kernel(
         tensor_args,
         constant_args,
         tables,
-        _head_dims(query, value),
     )
     captured_grads = tuple(None for _ in score_mod_other_buffers)
     return to_dtype(dq, query.get_dtype()), dk, dv, captured_grads

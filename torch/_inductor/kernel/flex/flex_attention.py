@@ -78,7 +78,7 @@ def _sanitize_kernel_options_for_triton(
     """
     sanitized = dict(kernel_options)
     backend = cast(_Backend, sanitized.pop("BACKEND", "AUTO"))
-    sanitized.pop("HELION_AUTOTUNE_EFFORT", None)
+    sanitized.pop("HELION_AUTOTUNE_TOLERANCE", None)
     return sanitized, backend
 
 
