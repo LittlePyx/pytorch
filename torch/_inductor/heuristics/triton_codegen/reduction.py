@@ -136,7 +136,13 @@ def _adapt_config_for_tiling(
 
 
 def _outer_config_opt(
-    make_config, size_hints, rnumel, inductor_meta, num_dynamic, register_intensive
+    make_config,
+    size_hints,
+    rnumel,
+    inductor_meta,
+    num_dynamic,
+    register_intensive,
+    device_cc=None,
 ):
     """Optimized outer config for CUDA (non-HIP)."""
     max_x_block, x_block = 256, 64
@@ -153,9 +159,18 @@ def _outer_config_opt(
     elif num_dynamic > 1:
         outer_r_block = max(min((rnumel // 64), 64), 8)
     elif num_dynamic == 1:
-        outer_r_block = (
-            1 if load_factor >= 3 else min(next_power_of_2(max(rnumel, 128) // 128), 8)
-        )
+        if (
+            load_factor >= 3
+            and device_cc == 100  # B200/GB200
+            and inductor_meta.get("sm100_outer_reduction_r0_block_8")
+        ):
+            outer_r_block, num_warps = 8, 2
+        else:
+            outer_r_block = (
+                1
+                if load_factor >= 3
+                else min(next_power_of_2(max(rnumel, 128) // 128), 8)
+            )
     else:
         x_block = max(min(max_x_block, next_power_of_2(x // 4096)), x_block)
         if load_factor < 4 or rnumel <= 128:
@@ -329,6 +344,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             inductor_meta,
             num_dynamic,
             register_intensive,
+            device_cc=triton_meta["device"].cc,
         )
 
         scalar_acc_configs: list[Config] = []
@@ -557,6 +573,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         inductor_meta,
         num_dynamic,
         register_intensive,
+        device_cc=None,
     ):
         """Outer config. CUDA uses optimized heuristic."""
         return _outer_config_opt(
@@ -566,6 +583,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             inductor_meta,
             num_dynamic,
             register_intensive,
+            device_cc,
         )
 
     def _finalize_configs(self, configs, make_config, size_hints, inductor_meta):
@@ -771,6 +789,7 @@ class ROCmReductionHeuristic(ReductionHeuristic):
         inductor_meta,
         num_dynamic,
         register_intensive,
+        device_cc=None,
     ):
         # HIP uses simple outer config (no outer_config_opt)
         return make_config(64, 8, register_intensive=register_intensive)

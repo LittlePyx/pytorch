@@ -2682,6 +2682,12 @@ class triton:
 
     dynamic_disable_pipelining = True
 
+    # On B200/GB200 (sm100), OUTER reductions with one dynamic dimension and at
+    # least three loads use R0_BLOCK=8 and num_warps=2 instead of R0_BLOCK=1.
+    sm100_outer_reduction_r0_block_8: bool = (
+        os.environ.get("TORCHINDUCTOR_SM100_OUTER_REDUCTION_R0_BLOCK_8", "0") == "1"
+    )
+
 
 class aot_inductor:
     """

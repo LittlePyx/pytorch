@@ -81,7 +81,7 @@ from torch._inductor.runtime.triton_heuristics import (
     triton_config,
 )
 from torch._inductor.test_case import run_tests, TestCase
-from torch._inductor.utils import fresh_cache
+from torch._inductor.utils import fresh_cache, run_and_get_code
 
 
 class _FindNamesProbe:
@@ -543,6 +543,46 @@ class TestTritonHeuristics(TestCase):
                 {"x": 256, "y": 256, "r0_": 4096},
                 {"min_xblock": 16},
             )
+
+    @parametrize(
+        "cc,knob,expected",
+        [
+            (100, True, (64, 8, 2)),
+            (100, False, (64, 1, 2)),
+            (90, True, (64, 1, 2)),
+            (103, True, (64, 1, 2)),
+        ],
+    )
+    def test_sm100_outer_reduction_r0_block_8(self, cc, knob, expected):
+        device = self._fake_cuda_device_properties()._replace(major=cc // 10, cc=cc)
+        inductor_meta = {"reduction_hint": ReductionHint.OUTER, "num_load": 3}
+        if knob:
+            inductor_meta["sm100_outer_reduction_r0_block_8"] = True
+
+        configs = _reduction_configs(
+            size_hints={"x": 65536, "r0_": 128},
+            inductor_meta=inductor_meta,
+            triton_meta={"device": device},
+            num_dynamic=1,
+        )
+
+        outer = configs[-1]
+        self.assertEqual(
+            (outer.kwargs["XBLOCK"], outer.kwargs["R0_BLOCK"], outer.num_warps),
+            expected,
+        )
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    def test_sm100_outer_reduction_r0_block_8_in_inductor_meta(self):
+        x = torch.randn(64, 64, device=GPU_TYPE)
+        for knob in (False, True):
+            torch._dynamo.reset()
+            with (
+                config.patch({"triton.sm100_outer_reduction_r0_block_8": knob}),
+                fresh_cache(),
+            ):
+                _, (code,) = run_and_get_code(torch.compile(lambda t: t.sum(0)), x)
+            self.assertEqual("'sm100_outer_reduction_r0_block_8': True" in code, knob)
 
     @parametrize(
         "major,cc,expected_baseline_configs,expected_scalar_configs",

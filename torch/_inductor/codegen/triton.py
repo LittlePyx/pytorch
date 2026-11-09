@@ -8010,6 +8010,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if torch.version.hip is not None:
             inductor_meta["is_hip"] = True
+        if config.triton.sm100_outer_reduction_r0_block_8:
+            inductor_meta["sm100_outer_reduction_r0_block_8"] = True
         if config.is_fbcode():
             inductor_meta["is_fbcode"] = True
         if config.profile_bandwidth:
