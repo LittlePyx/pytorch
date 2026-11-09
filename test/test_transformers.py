@@ -4452,7 +4452,6 @@ class TestSDPAAccelerator(NNTestCase):
         )
 
     @onlyCUDA
-    @skipIfRocm
     @unittest.skipIf(not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "Does not support Efficient Attention")
     @tf32_off()
     def test_mem_efficient_varlen_large_batch(self, device):
