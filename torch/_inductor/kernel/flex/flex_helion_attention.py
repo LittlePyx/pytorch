@@ -143,6 +143,9 @@ _PRETUNED_SM100: dict[tuple[str, int, int], dict[str, Any]] = {
 def ensure_helion_available() -> bool:
     """Whether helion and the CuTe DSL (nvidia-cutlass-dsl) its CuTe backend
     compiles with are importable; cached."""
+    # TODO: require the first Helion release after 1.5.2. 1.5.2 and older miss
+    # flex fixes the pretuned configs rely on (pytorch/helion#4296, #4298,
+    # #4319, #4320); without them some score/mask mods compile to wrong results.
     try:
         return all(
             importlib.util.find_spec(m) is not None for m in ("helion", "cutlass")
