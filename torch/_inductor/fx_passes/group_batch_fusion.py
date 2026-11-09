@@ -536,7 +536,7 @@ class BatchLinearLHSFusion(BatchFusion):
 
     @staticmethod
     def _reaches_user_visible_output(
-        node: torch.fx.Node, graph: torch.fx.GraphModule
+        node: torch.fx.Node, graph: torch.fx.Graph
     ) -> bool:
         output_node = next(n for n in graph.nodes if n.op == "output")
         args = output_node.args[0]
@@ -684,7 +684,7 @@ class BatchLinearLHSFusion(BatchFusion):
                 getitem.meta["example_value"] = split_values[i]
 
             new_node = getitem
-            if self._reaches_user_visible_output(node, graph):
+            if self._reaches_user_visible_output(node, graph):  # type: ignore[arg-type]
                 # A user-visible output, possibly through a view chain, must
                 # keep eager strides and own storage. Lowering only enforces
                 # stride order for views and would accept the wide row stride,
