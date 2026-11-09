@@ -723,8 +723,11 @@ def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda")
 
 
 def combine_grouped_gemm_values(values, cat_dim):
+    dtype = values[0].dtype
+    if dtype == torch.float8_e8m0fnu:
+        values = [value.view(torch.uint8) for value in values]
     result = torch.stack(values) if cat_dim is None else torch.cat(values, dim=cat_dim)
-    return result.contiguous()
+    return result.contiguous().view(dtype)
 
 def make_grouped_gemm_inputs(
     op, group_m, group_n, group_k, make_a, make_b, device, *, padded=False
@@ -769,3 +772,11 @@ def make_grouped_gemm_inputs(
             0, dtype=torch.int32
         )
     return a, b_t, offs, out_cat, a_groups, b_groups
+
+
+
+def to_mnk4(scales):
+    outer, inner = scales.shape
+    padded = torch.nn.functional.pad(scales, (0, -inner % 4, 0, -outer % 4))
+    packed = padded.reshape(padded.shape[0], padded.shape[1] // 4, 4).permute(1, 0, 2)
+    return packed.contiguous().flatten().to(torch.float8_e8m0fnu)
