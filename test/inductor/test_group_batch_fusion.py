@@ -839,7 +839,7 @@ class TestGroupBatchFusion(TestCase):
 
             def forward(self, x):
                 return (
-                    self.large(x).flatten(),
+                    self.large(x),
                     torch.sin(self.a(x)),
                     torch.cos(self.b(x)),
                 )
@@ -852,9 +852,9 @@ class TestGroupBatchFusion(TestCase):
             with _record_fusion_subsets() as subsets:
                 actual = torch.compile(module, fullgraph=True)(x)
         self.assertEqual(actual, expected)
-        # flatten is a layout-changing consumer, so lowering materializes the
-        # strided split slice before reshaping it.
-        self.assertEqual(actual[0].stride(), (1,))
+        # A direct graph output must keep eager strides and own storage.
+        self.assertEqual(actual[0].stride(), expected[0].stride())
+        self.assertEqual(actual[0].view(-1), expected[0].view(-1))
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [3])
 
@@ -884,15 +884,17 @@ class TestGroupBatchFusion(TestCase):
             self.assertEqual(getitem.meta["val"].shape, torch.Size([4, 6]))
             # The slice keeps the wide GEMM row stride, not the eager (6, 1).
             self.assertEqual(getitem.meta["val"].stride(), (18, 1))
-        # fuse() must not insert an explicit clone; lowering materializes from
-        # the strided meta only where a consumer requires another layout.
-        self.assertFalse(
-            any(node.target is torch.ops.aten.clone.default for node in graph.nodes)
-        )
+        # Direct graph outputs are materialized to eager contiguous slices;
+        # internal consumers keep the honest strided getitem.
         output = next(node for node in graph.nodes if node.op == "output")
-        self.assertTrue(
-            all(arg.target is operator.getitem for arg in output.args[0]),
-        )
+        clones = [
+            arg for arg in output.args[0] if arg.target is torch.ops.aten.clone.default
+        ]
+        self.assertEqual(len(clones), 3)
+        for clone in clones:
+            self.assertIs(clone.args[0].target, operator.getitem)
+            self.assertEqual(clone.meta["val"].shape, torch.Size([4, 6]))
+            self.assertEqual(clone.meta["val"].stride(), (6, 1))
         graph.lint()
 
     @torch._inductor.config.patch(
@@ -924,6 +926,8 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(actual[0].stride(), expected[0].stride())
         self.assertEqual(actual[0].stride(), (1,))
+        # self.v(x) is returned directly, so it must keep eager strides.
+        self.assertEqual(actual[2].stride(), expected[2].stride())
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
 
     @torch._inductor.config.patch(

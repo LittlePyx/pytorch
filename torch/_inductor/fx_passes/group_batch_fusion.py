@@ -550,11 +550,7 @@ class BatchLinearLHSFusion(BatchFusion):
             return None
         # as_strided reinterprets the raw storage and would observe the wide
         # GEMM row stride instead of the eager slice, so do not fuse across it.
-        if any(
-            user.target is aten.as_strided.default
-            or (isinstance(user.target, str) and user.target == "as_strided")
-            for user in node.users
-        ):
+        if any(user.target is aten.as_strided.default for user in node.users):
             return None
         weight_val = weight_m.meta["val"]  # type: ignore[union-attr]
         if not statically_known_true(weight_val.shape[1] > 0):
@@ -646,16 +642,30 @@ class BatchLinearLHSFusion(BatchFusion):
 
         for i, node in enumerate(batch_nodes):
             with graph.inserting_after(fused_lhs_list):  # type: ignore[operator]
-                new_node = graph.call_function(  # type: ignore[operator]
+                getitem = graph.call_function(  # type: ignore[operator]
                     operator.getitem, args=(fused_lhs_list, i)
                 )
-            new_node.meta.update(node.meta)
+            getitem.meta.update(node.meta)
             # The split slice keeps the wide GEMM row stride. Report it as-is
             # so lowering materializes a copy when a consumer needs another
             # layout, and never claim the eager contiguous (N_i, 1) stride.
-            new_node.meta["val"] = split_values[i]
-            if "example_value" in new_node.meta:
-                new_node.meta["example_value"] = split_values[i]
+            getitem.meta["val"] = split_values[i]
+            if "example_value" in getitem.meta:
+                getitem.meta["example_value"] = split_values[i]
+
+            new_node = getitem
+            if any(user.op == "output" for user in node.users):
+                # A direct graph output is user-visible: eager returns a
+                # contiguous tensor with independent storage. Materialize this
+                # slice so its stride and aliasing match eager. Other consumers
+                # keep the honest strided slice and lowering copies on demand.
+                with graph.inserting_after(getitem):  # type: ignore[operator]
+                    new_node = graph.call_function(  # type: ignore[operator]
+                        aten.clone.default,
+                        args=(getitem,),
+                        kwargs={"memory_format": torch.contiguous_format},
+                    )
+                new_node.meta.update(node.meta)
             node.replace_all_uses_with(new_node)
             graph.erase_node(node)  # type: ignore[operator]
         counters["inductor"]["batch_linear_lhs"] += 1
