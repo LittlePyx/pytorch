@@ -548,6 +548,14 @@ class BatchLinearLHSFusion(BatchFusion):
         # Replacing a mutated mm output with a split view can break autograd.
         if any(_is_mutable_node(user.target) for user in node.users):
             return None
+        # as_strided reinterprets the raw storage and would observe the wide
+        # GEMM row stride instead of the eager slice, so do not fuse across it.
+        if any(
+            user.target is aten.as_strided.default
+            or (isinstance(user.target, str) and user.target == "as_strided")
+            for user in node.users
+        ):
+            return None
         weight_val = weight_m.meta["val"]  # type: ignore[union-attr]
         if not statically_known_true(weight_val.shape[1] > 0):
             return None
@@ -648,23 +656,6 @@ class BatchLinearLHSFusion(BatchFusion):
             new_node.meta["val"] = split_values[i]
             if "example_value" in new_node.meta:
                 new_node.meta["example_value"] = split_values[i]
-            if _needs_eager_layout(node):
-                # Graph outputs and layout-sensitive consumers need the eager
-                # (N_i, 1) stride. Materialize before handing over the slice.
-                getitem_node = new_node
-                with graph.inserting_after(getitem_node):  # type: ignore[operator]
-                    new_node = graph.call_function(  # type: ignore[operator]
-                        aten.clone.default,
-                        args=(getitem_node,),
-                        kwargs={"memory_format": torch.contiguous_format},
-                    )
-                clone_value = aten.clone(
-                    split_values[i], memory_format=torch.contiguous_format
-                )
-                new_node.meta.update(node.meta)
-                new_node.meta["val"] = clone_value
-                if "example_value" in new_node.meta:
-                    new_node.meta["example_value"] = clone_value
             node.replace_all_uses_with(new_node)
             graph.erase_node(node)  # type: ignore[operator]
         counters["inductor"]["batch_linear_lhs"] += 1
@@ -683,70 +674,6 @@ def _is_mutable_node(tgt):
     ):
         # e.g. operator.iand, operator.imul
         return True
-    return False
-
-
-# Post-grad consumers that need the eager linear layout. Other consumers can
-# stay on the strided slice and let lowering materialize when it has a layout
-# constraint.
-_LAYOUT_MATERIALIZE_OPS = OrderedSet(
-    [
-        "clone",
-        "contiguous",
-        "copy",
-        "copy_",
-        "_to_copy",
-        "to",
-        "type",
-        "type_as",
-        "float",
-        "double",
-        "half",
-        "bfloat16",
-        "long",
-        "int",
-        "short",
-        "char",
-        "byte",
-        "bool",
-        "cpu",
-        "cuda",
-        "xpu",
-    ]
-)
-_LAYOUT_SAFE_METHODS = OrderedSet(["size", "dim", "numel", "sym_size"])
-
-
-def _needs_eager_layout(node: torch.fx.Node) -> bool:
-    for user in node.users:
-        if user.op in ("output", "call_module"):
-            return True
-        if user.kwargs.get("out") is not None or user.kwargs.get("inplace"):
-            return True
-        target = user.target
-        if isinstance(target, torch._ops.OpOverload):
-            if (
-                target.namespace != "aten"
-                or target._schema.is_mutable
-                or target.is_view
-            ):
-                return True
-            if target.overloadpacket.__name__ in _LAYOUT_MATERIALIZE_OPS:
-                return True
-        elif isinstance(target, torch._ops.OpOverloadPacket):
-            default = getattr(target, "default", None)
-            if default is None or default.namespace != "aten":
-                return True
-            if default._schema.is_mutable or default.is_view:
-                return True
-            if target.__name__ in _LAYOUT_MATERIALIZE_OPS:
-                return True
-        elif isinstance(target, str):
-            if target not in _LAYOUT_SAFE_METHODS:
-                return True
-        else:
-            # Unknown callables and HigherOrder ops are opaque.
-            return True
     return False
 
 

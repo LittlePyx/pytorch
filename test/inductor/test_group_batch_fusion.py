@@ -839,7 +839,7 @@ class TestGroupBatchFusion(TestCase):
 
             def forward(self, x):
                 return (
-                    self.large(x),
+                    self.large(x).flatten(),
                     torch.sin(self.a(x)),
                     torch.cos(self.b(x)),
                 )
@@ -852,8 +852,9 @@ class TestGroupBatchFusion(TestCase):
             with _record_fusion_subsets() as subsets:
                 actual = torch.compile(module, fullgraph=True)(x)
         self.assertEqual(actual, expected)
-        self.assertEqual(actual[0].stride(), expected[0].stride())
-        self.assertEqual(actual[0].view(-1), expected[0].view(-1))
+        # flatten is a layout-changing consumer, so lowering materializes the
+        # strided split slice before reshaping it.
+        self.assertEqual(actual[0].stride(), (1,))
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [3])
 
@@ -883,7 +884,15 @@ class TestGroupBatchFusion(TestCase):
             self.assertEqual(getitem.meta["val"].shape, torch.Size([4, 6]))
             # The slice keeps the wide GEMM row stride, not the eager (6, 1).
             self.assertEqual(getitem.meta["val"].stride(), (18, 1))
-        self.assertFalse(any(node.target is torch.clone for node in graph.nodes))
+        # fuse() must not insert an explicit clone; lowering materializes from
+        # the strided meta only where a consumer requires another layout.
+        self.assertFalse(
+            any(node.target is torch.ops.aten.clone.default for node in graph.nodes)
+        )
+        output = next(node for node in graph.nodes if node.op == "output")
+        self.assertTrue(
+            all(arg.target is operator.getitem for arg in output.args[0]),
+        )
         graph.lint()
 
     @torch._inductor.config.patch(
@@ -967,9 +976,13 @@ class TestGroupBatchFusion(TestCase):
         x = torch.randn(32, 64)
         with torch.no_grad():
             expected = module(x)
-            actual = torch.compile(module, fullgraph=True)(x)
+            with _record_fusion_subsets() as subsets:
+                actual = torch.compile(module, fullgraph=True)(x)
         self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+        # as_strided observes the raw storage, so lowering cannot materialize
+        # the wide GEMM row stride away. The pass must skip this fusion.
+        self.assertEqual(subsets, [])
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 0)
 
     def test_batch_linear_lhs_match_ignores_mm_dtype(self):
         from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
