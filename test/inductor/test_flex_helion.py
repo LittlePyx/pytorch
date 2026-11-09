@@ -110,11 +110,14 @@ class TestFlexHelion(InductorTestCase):
         torch.manual_seed(0)
         counters.clear()
 
-    def _check_against_triton(self, q, k, v, score_mod=None, block_mask=None):
+    def _check_against_triton(
+        self, q, k, v, score_mod=None, block_mask=None, max_scores=False
+    ):
         """Check BACKEND="HELION" against an fp32 reference: within twice
         BACKEND="TRITON"'s error plus the reference's input-dtype rounding.
         With grad-requiring inputs the loss reads both the output and the
-        logsumexp, so the backward also folds in the logsumexp's gradient."""
+        logsumexp, so the backward also folds in the logsumexp's gradient.
+        ``max_scores`` (forward only) also compares the returned row max."""
         backward = q.requires_grad
         b, hq, m, _ = q.shape
         grad_out = torch.randn(b, hq, m, v.size(-1), device="cuda")
@@ -129,9 +132,11 @@ class TestFlexHelion(InductorTestCase):
                 score_mod=score_mod,
                 block_mask=block_mask,
                 enable_gqa=q.size(1) != k.size(1),
-                return_aux=AuxRequest(lse=True),
+                return_aux=AuxRequest(lse=True, max_scores=max_scores),
                 kernel_options=kernel_options,
             )
+            if max_scores:
+                return out.float(), aux.lse, aux.max_scores
             if not backward:
                 return out.float(), aux.lse
             loss = (out * grad_out).sum() + (aux.lse * grad_lse).sum()
@@ -142,7 +147,7 @@ class TestFlexHelion(InductorTestCase):
         ref = run(flex_attention, *fp32)
         triton = run(compiled, q, k, v, {"BACKEND": "TRITON"})
         helion = run(compiled, q, k, v, HELION)
-        names = ("out", "lse", "dq", "dk", "dv")
+        names = ("out", "lse", "max_scores" if max_scores else "dq", "dk", "dv")
         for name, r, t, h in zip(names, ref, triton, helion):
             self.assertEqual(h.shape, r.shape)
             self.assertTrue(h.isfinite().all(), name)
@@ -164,6 +169,13 @@ class TestFlexHelion(InductorTestCase):
     @parametrize("case", CASES)
     def test_backward(self, case):
         self._check_against_triton(*_case(case))
+
+    # A full-block walk, a softcap score_mod, and captured-tensor gathers.
+    @parametrize("case", ["dense", "softcap_causal", "bias_document"])
+    def test_max_scores(self, case):
+        q, k, v, score_mod, block_mask = _case(case)
+        q, k, v = (t.detach() for t in (q, k, v))
+        self._check_against_triton(q, k, v, score_mod, block_mask, max_scores=True)
 
     def test_float16(self):
         mask = create_block_mask(_causal, None, None, 256, 256, device="cuda")
@@ -334,16 +346,6 @@ class TestFlexHelion(InductorTestCase):
         with self.assertRaisesRegex(Exception, "Invalid HELION_AUTOTUNE_EFFORT 'max'"):
             torch.compile(flex_attention)(
                 q, k, v, kernel_options={**HELION, "HELION_AUTOTUNE_EFFORT": "max"}
-            )
-
-    def test_rejects_max_scores(self):
-        q, k, v = _tensors(2, 4, 4, 256, 256, 64, requires_grad=False)
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            r"Returning max scores is not supported with BACKEND='HELION'",
-        ):
-            flex_attention(
-                q, k, v, return_aux=AuxRequest(max_scores=True), kernel_options=HELION
             )
 
     def test_rejects_float32(self):

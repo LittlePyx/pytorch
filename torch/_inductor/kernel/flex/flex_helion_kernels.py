@@ -9,8 +9,8 @@ tile grid walking the BlockMask's full and partial block lists, with
 broadcast coordinate vectors. Inductor passes the mods as FX GraphModules, which
 Helion inlines at trace time; the tensors they capture arrive in
 ``score_mod_buffers`` / ``mask_mod_buffers`` and are forwarded to them as
-trailing arguments. The forward stores the logsumexp in base 2, like Inductor's
-Triton flex_attention kernels.
+trailing arguments. The forward stores the logsumexp (and, with ``output_max``,
+the row max) in base 2, like Inductor's Triton flex_attention kernels.
 
 This module imports helion; only BACKEND="HELION" imports it.
 """
@@ -46,7 +46,8 @@ def flex_attention_forward(
     scale: float,
     score_mod_buffers: tuple[torch.Tensor, ...],
     mask_mod_buffers: tuple[torch.Tensor, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    output_max: hl.constexpr,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, H, M, D = query.size()
     D = hl.specialize(D)
     # The V/O head dim may differ from the Q/K head dim.
@@ -63,6 +64,11 @@ def flex_attention_forward(
     else:
         out = torch.empty((B, H, M, Dv), dtype=query.dtype, device=query.device)
     lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)
+    # Without output_max the row max is not stored; an empty placeholder
+    # keeps the kernel's outputs fixed.
+    max_scores = torch.empty(
+        (B, H, M) if output_max else (0,), dtype=torch.float32, device=out.device
+    )
     log_2_e = 1.44269504
     block_m = hl.register_block_size(min(256, block_mask_m))
     block_n = hl.register_block_size(min(256, block_mask_n))
@@ -163,7 +169,10 @@ def flex_attention_forward(
         acc = acc / l_i[:, None]
         out[tile_b, tile_h, tile_m, :] = acc[None, None, :, :].to(out.dtype)
         lse[tile_b, tile_h, tile_m] = lse_row[None, None, :]
-    return out, lse
+        if output_max:
+            # The running row max, in base 2 like the logsumexp.
+            max_scores[tile_b, tile_h, tile_m] = m_i[None, None, :]
+    return out, lse, max_scores
 
 
 def flex_attention_backward(

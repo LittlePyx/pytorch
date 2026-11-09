@@ -41,7 +41,7 @@ from ...ir import (
     TemplateBuffer,
     TensorBox,
 )
-from ...lowering import empty_strided, full, lowerings, to_dtype
+from ...lowering import full, lowerings, to_dtype
 from ...virtualized import V
 
 
@@ -575,8 +575,8 @@ def create_flex_helion_attention_kernel(
 ) -> tuple[TensorBox, TensorBox, TensorBox]:
     """Lower the flex_attention forward to the Helion forward kernel.
 
-    Returns (out, logsumexp in base 2, max_scores); the frontend rejects
-    BACKEND="HELION" requests for max_scores, which the kernel does not compute.
+    Returns (out, logsumexp in base 2, max_scores in base 2); max_scores is an
+    empty placeholder unless the frontend asks for it (``OUTPUT_MAX``).
     """
     sparse_q, sparse_kv, mask_graph = block_mask[-3:]
     query, key, value = (_specialized(t) for t in (query, key, value))
@@ -608,19 +608,19 @@ def create_flex_helion_attention_kernel(
         "block_mask_m": block_m,
         "block_mask_n": block_n,
         "scale": float(scale),
+        # A row-max store keeps the fused plan off its dense bodies, so the
+        # kernel stores it only on request.
+        "output_max": bool(kernel_options.get("OUTPUT_MAX", False)),
     }
     _container_specs(tensor_args, constant_args, score_mod_buffers, mask_mod_buffers)
 
-    out, lse = _lower(
+    out, lse, max_scores = _lower(
         "forward",
         kernel_options,
         tensor_args,
         constant_args,
         tables,
         _head_dims(query, value),
-    )
-    max_scores = empty_strided(
-        lse.get_size(), None, dtype=torch.float32, device=lse.get_device()
     )
     return out, lse, max_scores
 

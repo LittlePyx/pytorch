@@ -2236,9 +2236,9 @@ def _apply_kernel_options(
     # If forward kernel needs to return max is decided by this rule internally.
     if "OUTPUT_MAX" in kernel_options:
         raise AssertionError("OUTPUT_MAX must not be in kernel_options")
-    if kernel_options["BACKEND"] in ("FLASH", "HELION") and output_max:
+    if kernel_options["BACKEND"] == "FLASH" and output_max:
         raise NotImplementedError(
-            f"Returning max scores is not supported with BACKEND={kernel_options['BACKEND']!r}. "
+            "Returning max scores is not supported with BACKEND='FLASH'. "
             "Use return_aux=AuxRequest(lse=True) or omit max_scores."
         )
     kernel_options["OUTPUT_MAX"] = output_max
