@@ -14,7 +14,7 @@ from torch._higher_order_ops.auto_functionalize import (
 )
 from torch._inductor import inductor_prims
 from torch._inductor.fx_passes.reinplace import reinplace_inplaceable_ops_core
-from torch._inductor.fx_utils import FakeTensorUpdater
+from torch._inductor.fx_utils import FakeTensorUpdater, get_node_storage
 from torch._inductor.virtualized import V
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
 from torch.testing._internal.common_utils import (
@@ -125,6 +125,46 @@ class TestReinplacingPassCorrectness(InductorTestCase):
             return x.index_put((y,), const)
 
         self._test(f)
+
+    @parametrize("e2e", [False, True])
+    def test_chained_reinplacement_preserves_last_result(self, e2e):
+        class Model(torch.nn.Module):
+            def forward(self, x, indices, first_values, second_values, replacement):
+                first = x.index_put((indices,), first_values)
+                second = first.index_put((indices,), second_values)
+                x.copy_(replacement)
+                return second
+
+        model = Model()
+        x = torch.arange(8, dtype=torch.float32).reshape(2, 4).clone()
+        inputs = (
+            torch.tensor([0]),
+            torch.full((4,), 10.0),
+            torch.full((4,), 20.0),
+            torch.full_like(x, -1.0),
+        )
+        expected_input = x.clone()
+        expected = model(expected_input, *inputs)
+        actual_input = x.clone()
+        if e2e:
+            compiled = torch.compile(model, fullgraph=True)
+        else:
+            compiled = make_fx(model, tracing_mode="fake")(x, *inputs)
+            reinplace_inplaceable_ops_core(compiled.graph)
+            compiled.graph.lint()
+            compiled.recompile()
+        actual = compiled(actual_input, *inputs)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual_input, expected_input)
+        if not e2e:
+            first = next(
+                n for n in compiled.graph.nodes if n.target is aten.index_put_.default
+            )
+            second = next(
+                n for n in compiled.graph.nodes if n.target is aten.index_put.default
+            )
+            self.assertEqual(get_node_storage(first), get_node_storage(first.args[0]))
+            self.assertNotEqual(get_node_storage(second), get_node_storage(first))
 
     def test_should_modify_inner(self):
         def f(x, y):
