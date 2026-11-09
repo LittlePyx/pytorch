@@ -3662,6 +3662,10 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        if user_cls is dict:
+            result = ConstDictVariable({}, mutation_type=ValueMutationNew())
+            result.dict_update_common(tx, list(args), kwargs, method_name="dict")
+            return result
         args_list = list(args)
         return tx.inline_user_function_return(
             VariableTracker.build(tx, polyfills.construct_dict),
