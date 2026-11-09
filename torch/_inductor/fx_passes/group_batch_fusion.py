@@ -536,7 +536,7 @@ class BatchLinearLHSFusion(BatchFusion):
 
     @staticmethod
     def _reaches_user_visible_output(
-        node: torch.fx.Node, graph: torch.fx.Graph
+        node: torch.fx.Node, graph: torch.fx.GraphModule
     ) -> bool:
         output_node = next(n for n in graph.nodes if n.op == "output")
         args = output_node.args[0]
@@ -544,13 +544,13 @@ class BatchLinearLHSFusion(BatchFusion):
             args = (args,)
         visible_idxs = output_node.meta.get("user_visible_output_idxs")
         if visible_idxs is None:
-            visible = {arg for arg in args if isinstance(arg, torch.fx.Node)}
+            visible = OrderedSet(arg for arg in args if isinstance(arg, torch.fx.Node))
         else:
-            visible = {
+            visible = OrderedSet(
                 args[i]
                 for i in visible_idxs
                 if i < len(args) and isinstance(args[i], torch.fx.Node)
-            }
+            )
         pending = [node]
         seen = OrderedSet([node])
         while pending:
