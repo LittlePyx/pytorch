@@ -62,7 +62,12 @@ from .autograd_cache import (
     should_use_remote_autograd_cache,
 )
 from .codegen import aggregate_runtime_wrapper_sources
-from .descriptors import AOTOutput, ForwardTokenAOTInput, PlainAOTOutput
+from .descriptors import (
+    AOTOutput,
+    ForwardTokenAOTInput,
+    PlainAOTInput,
+    PlainAOTOutput,
+)
 from .graph_capture import aot_dispatch_autograd_graph, aot_dispatch_base_graph
 from .logging_utils import track_graph_compiling
 from .runtime_wrappers import (
@@ -1499,6 +1504,19 @@ def maybe_inline_graph_saved_tensors_hooks(
     elif mode == "no_static":
         fw_g_inputs = fw_g.find_nodes(op="placeholder")
         exclude_set = {fw_g_inputs[i].name for i in static_input_indices}
+
+    # Marked inputs saved for backward reach the hooks in every mode, which
+    # find them through node.meta["saved_tensors_hooks_input"].
+    marked = set(aot_config.saved_tensors_hooks_input_indices or ())
+    saved = set(fw_outs_saved_for_bw)
+    for node in fw_g.find_nodes(op="placeholder"):
+        desc = node.meta.get("desc")
+        if isinstance(desc, PlainAOTInput) and desc.idx in marked and node in saved:
+            node.meta["saved_tensors_hooks_input"] = True
+            if allow_set is not None:
+                allow_set.add(node.name)
+            if exclude_set is not None:
+                exclude_set.discard(node.name)
 
     if (allow_set is not None) and (not allow_set):
         # This means we have empty whitelist,
