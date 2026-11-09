@@ -168,6 +168,7 @@ if(NOT __AOTRITON_INCLUDED)
     # TheRock vendors liblzma; its prefix lets pkg_search_module find liblzma.pc.
     if(EXISTS "${ROCM_PATH}/lib/rocm_sysdeps/lib/pkgconfig")
       list(APPEND __AOTRITON_ROCM_ARGS "-DCMAKE_PREFIX_PATH=${ROCM_PATH}/lib/rocm_sysdeps")
+      list(APPEND __AOTRITON_ROCM_ARGS "-DCMAKE_INSTALL_RPATH=$ORIGIN/../../_rocm_sdk_core/lib/rocm_sysdeps/lib:${ROCM_PATH}/lib/rocm_sysdeps/lib")
     endif()
 
     ExternalProject_Add(${project}
