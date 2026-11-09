@@ -21,6 +21,7 @@ from torch._higher_order_ops.user_kernel_hop import (
 from torch._inductor import config, inductor_prims
 from torch._inductor.fx_utils import (
     _same_size_stride_and_storage_offset,
+    FakeTensorUpdater,
     get_node_storage,
     is_node_realized,
 )
@@ -516,7 +517,9 @@ def _is_control_deps_ordering_only_use(
     return view in additional_deps and view not in pass_through
 
 
-def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
+def reinplace_inplaceable_ops_core(
+    graph: torch.fx.Graph, fake_tensor_updater: FakeTensorUpdater | None = None
+) -> None:
     """
     Reinplaces in-placeable operations.
     If there are no uses of a view of the mutated arg after the current node,
@@ -534,6 +537,11 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
     input args, so instead of checking mutation on placeholder, AOTInductor
     checks mutation on get_attr. This is subject to change in future.
     """
+
+    if fake_tensor_updater is None:
+        if graph.owning_module is None:
+            raise AssertionError("reinplacement requires a graph owning module")
+        fake_tensor_updater = FakeTensorUpdater(graph.owning_module)
 
     copy_args_to_copy_nodes = {}
     # maps argument to the first copy_ node that mutates it.
@@ -844,7 +852,28 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
         )
         return tensors_to_clone
 
+    def apply_replacements():
+        for replaced, replacement in replace_dict.items():
+            if replaced._erased:
+                continue
+            while replacement in replace_dict:
+                replacement = replace_dict[replacement]
+            replace_dict[replaced] = replacement
+            replaced.replace_all_uses_with(replacement)
+            graph.erase_node(replaced)
+
+    def refresh_metadata():
+        apply_replacements()
+        fake_mode = detect_fake_mode([n.meta.get("val") for n in graph.nodes])
+        with V.set_fake_mode(fake_mode):
+            fake_tensor_updater.incremental_update()
+        storage_to_nodes.clear()
+        for updated in graph.nodes:
+            storage_to_nodes[get_node_storage(updated)].append(updated)
+
     for node in graph.nodes:
+        previous_hash = fake_tensor_updater.hash_node(node)
+        previous_replacements = len(replace_dict)
         if (inplaceable_op := inplaceable_ops.get(node.target)) is not None:
             # Check if ALL mutated args can be inplaced
             # Only convert if we don't need to clone any tensor
@@ -1063,13 +1092,12 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
                     replace_dict[copy_node] = copy_node.args[0]
 
                 node.target = inplaceable_op.inplace_op
-    for node, replacement in replace_dict.items():
-        while replacement in replace_dict:
-            replacement = replace_dict[replacement]
-        replace_dict[node] = replacement
-
-        node.replace_all_uses_with(replacement)
-        graph.erase_node(node)
+        if (
+            fake_tensor_updater.hash_node(node) != previous_hash
+            or len(replace_dict) != previous_replacements
+        ):
+            refresh_metadata()
+    apply_replacements()
 
 
 def reinplace_inplaceable_ops(
@@ -1082,5 +1110,6 @@ def reinplace_inplaceable_ops(
         # We run fake_tensor_updater to update the alias information.
         # Correct alias information is required for `reinplace_inplaceable_ops_core`.
         fake_tensor_updater.incremental_update()
-        reinplace_inplaceable_ops_core(graph)
+        reinplace_inplaceable_ops_core(graph, fake_tensor_updater)
         decompose_generalized_scatter(graph)
+        fake_tensor_updater.incremental_update()
