@@ -1450,24 +1450,49 @@ class TestInductorConfigParsingForLogging(TestCase):
             """"name": "Value is not JSON serializable", "some": true}, """
             """"some": {"name": "Value is not JSON serializable", "some": true}}"""
         )
-        mocked_inductor_config.get_config_copy.return_value = test_mock_config
+        get_copy = mocked_inductor_config.get_serializable_config_copy
+        get_copy.return_value = test_mock_config
         inductor_config_json = utils._scrubbed_inductor_config_for_logging()
         self.assertEqual(inductor_config_json, expected)
 
         expected = "{}"
-        mocked_inductor_config.get_config_copy.return_value = {obj: obj}
+        get_copy.return_value = {obj: obj}
         inductor_config_json = utils._scrubbed_inductor_config_for_logging()
         self.assertEqual(inductor_config_json, expected)
 
         expected = "Inductor Config is not JSON serializable"
-        mocked_inductor_config.get_config_copy.return_value = obj
+        get_copy.return_value = obj
         inductor_config_json = utils._scrubbed_inductor_config_for_logging()
         self.assertEqual(inductor_config_json, expected)
 
         expected = None
-        mocked_inductor_config.get_config_copy.return_value = None
+        get_copy.return_value = None
         inductor_config_json = utils._scrubbed_inductor_config_for_logging()
         self.assertEqual(inductor_config_json, expected)
+
+    def test_inductor_config_logging_does_not_copy_custom_passes(self):
+        # Custom passes can hold arbitrary objects, such as FX graphs and the fake
+        # tensors in their metadata. Logging only serializes the config, so it
+        # must not deep-copy them.
+        from torch._inductor.custom_graph_pass import CustomGraphPass
+
+        copied = []
+
+        class RecordingPass(CustomGraphPass):
+            def __call__(self, graph):
+                pass
+
+            def uuid(self):
+                return None
+
+            def __deepcopy__(self, memo):
+                copied.append(self)
+                return self
+
+        with inductor_config.patch(post_grad_custom_pre_pass=RecordingPass()):
+            inductor_config_json = utils._scrubbed_inductor_config_for_logging()
+        self.assertEqual(copied, [])
+        self.assertNotIn("post_grad_custom_pre_pass", json.loads(inductor_config_json))
 
 
 class TestFunctorchConfigParsingForLogging(TestCase):
