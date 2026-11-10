@@ -33,6 +33,7 @@ from .. import config, graph_break_hints, polyfills, variables
 from ..exc import (
     handle_observed_exception,
     ObservedTypeError,
+    raise_attribute_error,
     raise_observed_exception,
     raise_type_error,
     UnhandledDescriptorError,
@@ -2550,7 +2551,13 @@ def generic_getattr(
     # Side effects: check for pending attribute mutations.
     if tx.output.side_effects.has_pending_mutation_of_attr(obj, name):
         if not isinstance(obj, variables.UserDefinedObjectVariable):
-            value = tx.output.side_effects.load_attr(obj, name)
+            value = tx.output.side_effects.load_attr(obj, name, deleted_ok=True)
+            if isinstance(value, variables.DeletedVariable):
+                # Reading an attribute that a pending replay deletes must
+                # raise what eager raises, not fall back to the stale
+                # real-object value (the delete has not run yet at trace
+                # time).
+                raise_attribute_error(tx, f"object has no attribute '{name}'")
             # A pending store of a descriptor onto a class lands in cls.__dict__,
             # so reading it back has to run tp_descr_get the way type_getattro
             # does -- otherwise `C.h = staticmethod(f); type(C.h)` reports

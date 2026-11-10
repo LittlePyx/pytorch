@@ -3404,6 +3404,26 @@
       ]
     }
   ],
+  "GB1811": [
+    {
+      "Gb_type": "DELETE_GLOBAL in unregistered module globals",
+      "Context": "module_name: {self.f_globals.get('__name__')}",
+      "Explanation": "Dynamo cannot safely replay global deletes for a frame whose globals dict is not the registered module __dict__.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB8630": [
+    {
+      "Gb_type": "DELETE_GLOBAL in module with __getattr__",
+      "Context": "name",
+      "Explanation": "Dynamo cannot safely replay global deletes for a module that defines __getattr__.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
   "GB5491": [
     {
       "Gb_type": "Failed to mutate tensor data attribute across devices with different shape/strides",
@@ -7137,6 +7157,16 @@
       "Hints": [
         "Use OrderedDict methods instead of raw dict writes such as dict.__setitem__(mapping, key, value).",
         "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    }
+  ],
+  "GB4909": [
+    {
+      "Gb_type": "DELETE_GLOBAL in non-module globals",
+      "Context": "name",
+      "Explanation": "Dynamo cannot safely replay global deletes for an inlined function whose globals dict is not the registered module __dict__.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
   ]

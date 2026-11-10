@@ -580,6 +580,16 @@ class SideEffects:
             if item_source is not None:
                 self.mutated_sources.add(AttrSource(item_source, name))
 
+    def discard_attr_mutation(self, item: VariableTracker, name: str) -> None:
+        """Drop a recorded mutation that eager never leaves behind."""
+        self.store_attr_mutations.get(item, {}).pop(name, None)
+        self.attr_mutation_kinds.get(item, {}).pop(name, None)
+        if item in self.store_attr_mutations and (
+            not self.store_attr_mutations[item] and not self.attr_mutation_kinds[item]
+        ):
+            self.store_attr_mutations.pop(item, None)
+            self.attr_mutation_kinds.pop(item, None)
+
     def store_instance_dict_attr(
         self, item: VariableTracker, name: str, value: VariableTracker
     ) -> None:
@@ -1001,6 +1011,8 @@ class SideEffects:
         return variable
 
     def track_global_existing(self, source: Source, item: object) -> VariableTracker:
+        if id(item) in self.id_to_variable:
+            return self.id_to_variable[id(item)]
         variable = variables.NewGlobalVariable.create(source)
         self.id_to_variable[id(item)] = variable
         self.keepalive.append(item)
@@ -2023,15 +2035,28 @@ def _codegen_attribute_mutation(ctx: SideEffectReplayContext) -> None:
     for name, value in reversed(side_effects.store_attr_mutations.get(var, {}).items()):
         mutation_kind = side_effects.get_attr_mutation_kind(var, name)
         if isinstance(var, variables.NewGlobalVariable):
-            cg.tx.output.update_co_names(name)
-            cg(value)
             if not isinstance(var.source, GlobalSource):  # type: ignore[attr-defined]
                 raise AssertionError(
                     f"Expected GlobalSource for NewGlobalVariable, "
                     f"got {type(var.source)}"  # type: ignore[attr-defined]
                 )
-            ctx.suffixes.append([create_instruction("STORE_GLOBAL", argval=name)])
-            side_effect_occurred = True
+            if isinstance(value, variables.DeletedVariable):
+                # TODO(3.16): CPython 3.16 compiles `del name` to PUSH_NULL;
+                # STORE_GLOBAL, so emit that pair once 3.16 is supported.
+                # Through 3.15, STORE_GLOBAL would write the null as an
+                # ordinary value into the dict, so DELETE_GLOBAL must be
+                # emitted.
+                if name in cg.tx.output.global_scope:
+                    cg.tx.output.update_co_names(name)
+                    ctx.suffixes.append(
+                        [create_instruction("DELETE_GLOBAL", argval=name)]
+                    )
+                    side_effect_occurred = True
+            else:
+                cg.tx.output.update_co_names(name)
+                cg(value)
+                ctx.suffixes.append([create_instruction("STORE_GLOBAL", argval=name)])
+                side_effect_occurred = True
         elif isinstance(value, variables.DeletedVariable):
             if isinstance(var, variables.CellVariable):
                 # Cells created during inlining (no local_name) are rebuilt via
