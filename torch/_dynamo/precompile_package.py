@@ -1842,11 +1842,13 @@ class PrecompileSession(Generic[_P, _R]):
         | None = None,
         recompile_limit: int = 256,
         dynamic: bool | None = None,
+        fullgraph: bool = False,
     ) -> None:
         self._fn = fn
         self._backend = backend
         self._recompile_limit = recompile_limit
         self._dynamic = dynamic
+        self._fullgraph = fullgraph
         self._custom_guard_filter = guard_filter_fn is not None
         self._dropped_guard_code: dict[tuple[str, str], str] = {}
         # slot -> the frames whose compiles kept / dropped / riskily dropped it
@@ -1947,6 +1949,7 @@ class PrecompileSession(Generic[_P, _R]):
             dynamic=self._dynamic,
             recompile_limit=self._recompile_limit,
             isolate_recompiles=True,
+            nopython=self._fullgraph,
         )(self._fn)
         return self._call
 
@@ -2274,6 +2277,7 @@ def precompile_capture(
     | None = None,
     recompile_limit: int = 256,
     dynamic: bool | None = None,
+    fullgraph: bool = False,
 ) -> PrecompileSession[_P, _R]:
     """Begin capturing ``fn`` into a multi-graph artifact.
 
@@ -2282,7 +2286,10 @@ def precompile_capture(
     limit exists to catch runaway recompilation. ``guard_filter_fn`` applies to
     the runtime guards as well as the serialized ones, so a dropped guard never
     triggers a recompile during capture, just as it cannot pick a graph at serve
-    time.
+    time. ``fullgraph`` makes a graph break an error, as
+    ``torch.compile(fullgraph=True)`` does, so the capture is one frame with no
+    graph-break continuations; each recompile adds a graph to that frame, and a
+    recompile past ``recompile_limit`` raises rather than running eager.
     """
     if isinstance(fn, functools.partial):
         raise PackageError(
@@ -2311,4 +2318,5 @@ def precompile_capture(
         guard_filter_fn=guard_filter_fn,
         recompile_limit=recompile_limit,
         dynamic=dynamic,
+        fullgraph=fullgraph,
     )
