@@ -12,7 +12,7 @@ from torch._logging import trace_structured
 from torch.fx.experimental.symbolic_shapes import free_symbols, statically_known_true
 from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.graph_transform_observer import GraphTransformObserver
-from torch.fx.passes.reinplace import _is_view_op
+from torch.fx.passes.reinplace import _get_view_type, _is_view_op, _ViewType
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config
@@ -555,12 +555,16 @@ class BatchLinearLHSFusion(BatchFusion):
         seen = OrderedSet([node])
         while pending:
             cur = pending.pop()
+            multi_output_view = _get_view_type(cur.target) is _ViewType.MultiOutputView
             for user in cur.users:
                 if user.op == "output" and cur in visible:
                     return True
-                if _is_view_op(user.target) and user not in seen:
-                    seen.add(user)
-                    pending.append(user)
+                if _is_view_op(user.target) or (
+                    multi_output_view and user.target is operator.getitem
+                ):
+                    if user not in seen:
+                        seen.add(user)
+                        pending.append(user)
         return False
 
     def match(self, node: torch.fx.Node):

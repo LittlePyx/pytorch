@@ -858,12 +858,13 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [3])
 
+    @parametrize("view", ["unsqueeze", "split"])
     @torch._inductor.config.patch(
         post_grad_fusion_options={
             "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
         },
     )
-    def test_batch_linear_lhs_materializes_output_views(self):
+    def test_batch_linear_lhs_materializes_output_views(self, view):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -872,11 +873,13 @@ class TestGroupBatchFusion(TestCase):
                 self.b = torch.nn.Linear(64, 16, bias=False)
 
             def forward(self, x):
-                return (
-                    self.large(x).unsqueeze(0),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
+                large = self.large(x)
+                large = (
+                    large.unsqueeze(0)
+                    if view == "unsqueeze"
+                    else large.split(16, dim=0)[0]
                 )
+                return large, torch.sin(self.a(x)), torch.cos(self.b(x))
 
         counters.clear()
         module = M().eval()
