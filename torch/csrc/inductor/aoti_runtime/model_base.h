@@ -316,6 +316,9 @@ int munmap(void* addr, size_t length) {
 // C ABI defined in torch/csrc/inductor/aoti_torch/c/shim.h. The same rule
 // applies to other files under torch/csrc/inductor/aoti_runtime/.
 #include <torch/csrc/inductor/aoti_runtime/device_utils.h>
+#if defined(USE_CUDA) && defined(USE_ROCM)
+#include <hip/hip_ext.h>
+#endif
 #ifdef USE_MPS
 #include <torch/csrc/inductor/aoti_torch/c/shim_mps.h>
 #endif // USE_MPS
@@ -380,21 +383,14 @@ using torch::aot_inductor::RAIIAtenTensorHandle;
 
 #ifdef USE_CUDA
 
-// Process-wide, per-device H2D stream shared by every PinnedStagingPool.
+// Per-device H2D stream shared by every PinnedStagingPool in this model .so.
+// On ROCm it is only the fallback for createOwnedConstantsH2DStream() below.
 //
-// A stream must NOT be created per pool. On ROCm, destroying a stream that is
-// not CU-masked does not release its hsa_queue_t: Device::releaseQueue
-// (rocclr/device/rocm/rocdevice.cpp) only calls hsa_queue_destroy and erases
-// from queuePool_ when the queue is CU-masked, so the queue stays parked at
-// refcount 0 until ~Device. One stream per constant load or in-place update
-// therefore ratchets the process up to GPU_MAX_HW_QUEUES and never gives the
-// queues back. Once the pool saturates at the cap, every queue above the four
-// MI300X scheduling pipes adds queue-switch overhead to serving streams.
-//
-// Created once per device and intentionally never destroyed, so the process
-// holds exactly one extra queue per device no matter how many loads or updates
-// run. Returns nullptr when the device cannot be resolved or stream creation
-// fails, so callers fall back to the synchronous copy path.
+// Created once per device and intentionally never destroyed. The statics
+// belong to this .so: every model .so loaded into a process has its own copy,
+// so the process holds one such stream per device per loaded model .so.
+// Returns nullptr when the device cannot be resolved or stream creation fails,
+// so callers fall back to the synchronous copy path.
 //
 // Creation is retried on a later call if it fails, rather than latched with
 // call_once: these processes are long-lived and serve many loads, so a
@@ -433,6 +429,59 @@ inline cudaStream_t sharedConstantsH2DStream() {
   }
   return stream;
 }
+
+#ifdef USE_ROCM
+// Creates a stream for one PinnedStagingPool, which destroys it. The stream is
+// CU-masked to every CU of the current device. Returns nullptr on failure.
+//
+// On ROCm a plain stream's hsa_queue_t outlives the stream: ROCclr keeps it in
+// the device's queue pool until the process exits. On MI300X with ROCm 7.0,
+// 24 cycles of creating, using and destroying a plain stream grew the pool to
+// GPU_MAX_HW_QUEUES (16) and kept it there, so a stream per constant load or
+// in-place update ratchets the process up to the cap, and so does a stream
+// per model .so that is never destroyed. Once the pool is at the cap, every
+// queue above the four MI300X scheduling pipes adds queue-switch overhead to
+// serving streams. ROCclr does not pool CU-masked queues and destroys one when
+// its last stream is destroyed (Device::releaseQueue in
+// rocclr/device/rocm/rocdevice.cpp); the same 24 cycles with a CU-masked
+// stream never held more than one extra queue.
+//
+// A mask of every CU schedules on the same CUs as a plain stream; the mask is
+// only there to keep the queue out of the pool. This relies on ROCclr's
+// releaseQueue behavior: if ROCclr starts pooling CU-masked queues, revisit.
+inline cudaStream_t createOwnedConstantsH2DStream() {
+  int device = 0;
+  int cu_count = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(
+          &cu_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
+      cu_count <= 0) {
+    (void)cudaGetLastError();
+    AOTI_LOG_LOADING(
+        "PinnedStagingPool: could not query CU count for device "
+        << device << "; using the shared H2D stream");
+    return nullptr;
+  }
+  std::vector<uint32_t> cu_mask((cu_count + 31) / 32, 0xffffffffu);
+  if (cu_count % 32 != 0) {
+    cu_mask.back() = (uint32_t{1} << (cu_count % 32)) - 1;
+  }
+  cudaStream_t stream = nullptr;
+  if (hipExtStreamCreateWithCUMask(
+          &stream, static_cast<uint32_t>(cu_mask.size()), cu_mask.data()) !=
+      hipSuccess) {
+    (void)cudaGetLastError();
+    AOTI_LOG_LOADING(
+        "PinnedStagingPool: CU-masked stream creation failed for device "
+        << device << "; using the shared H2D stream");
+    return nullptr;
+  }
+  AOTI_LOG_LOADING(
+      "PinnedStagingPool: created CU-masked H2D stream for device "
+      << device << " (destroyed with the pool)");
+  return stream;
+}
+#endif // USE_ROCM
 
 struct StageCopyTask {
   uint8_t* dst;
@@ -621,11 +670,16 @@ class PinnedStagingPool {
     pool->use_copy_tasks_ = use_copy_tasks;
     pool->cpu_copy_threads_ =
         use_copy_tasks ? std::max<size_t>(cpu_copy_threads, 1) : 1;
-    // Borrowed, not owned: shared per-device stream, never destroyed.
-    pool->stream_ = sharedConstantsH2DStream();
+#ifdef USE_ROCM
+    pool->stream_ = createOwnedConstantsH2DStream();
+    pool->owns_stream_ = pool->stream_ != nullptr;
+#endif
+    if (pool->stream_ == nullptr) {
+      pool->stream_ = sharedConstantsH2DStream();
+    }
     if (pool->stream_ == nullptr) {
       AOTI_LOG_LOADING(
-          "PinnedStagingPool: shared per-device H2D stream unavailable; "
+          "PinnedStagingPool: H2D stream unavailable; "
           "falling back to sync copy");
       return nullptr;
     }
@@ -755,11 +809,9 @@ class PinnedStagingPool {
     // reverse declaration order; stage_tensors_ is last-declared so it runs
     // first among members.
     //
-    // stream_ is borrowed from sharedConstantsH2DStream() and is deliberately
-    // NOT destroyed here; see that function for why destroying it would leak
-    // an hsa_queue_t on ROCm. Wait on this pool's own events rather than the
-    // shared stream so an unrelated pool's in-flight copies do not gate this
-    // destructor.
+    // Wait on this pool's own events rather than the stream, which may be
+    // shared, so an unrelated pool's in-flight copies do not gate this
+    // destructor. Only an owned stream is destroyed, after the waits.
     if (pending_bytes_ != 0) {
       AOTI_LOG_LOADING(
           "~PinnedStagingPool: destroyed with "
@@ -786,6 +838,16 @@ class PinnedStagingPool {
             "~PinnedStagingPool: cudaEventDestroy buf="
             << i << " failed rc=" << rc << " (" << cudaGetErrorString(rc)
             << ")");
+      }
+    }
+    // Safe even if a wait above failed: hipStreamDestroy blocks until work
+    // already queued on the stream completes.
+    if (owns_stream_) {
+      cudaError_t rc = cudaStreamDestroy(stream_);
+      if (rc != cudaSuccess) {
+        AOTI_LOG_LOADING(
+            "~PinnedStagingPool: cudaStreamDestroy failed rc="
+            << rc << " (" << cudaGetErrorString(rc) << ")");
       }
     }
     // Clear any error left by best-effort cleanup.
@@ -948,10 +1010,11 @@ class PinnedStagingPool {
     }
   }
 
-  // Borrowed from sharedConstantsH2DStream(); not owned, never destroyed.
-  // Concurrent pools share it, which serializes their copies but keeps the
-  // process at one hardware queue per device.
+  // Owned on ROCm (see createOwnedConstantsH2DStream()). Otherwise borrowed
+  // from sharedConstantsH2DStream(), never destroyed, and shared with the
+  // other pools of this .so, which serializes their copies.
   cudaStream_t stream_{nullptr};
+  bool owns_stream_{false};
   std::array<cudaEvent_t, 2> events_{};
   // Cached borrowed pointers into stage_tensors_[i] to avoid a shim call
   // per chunk in the hot path.
@@ -1067,9 +1130,8 @@ inline std::unique_ptr<PinnedStagingPool> tryMakeConstantsStagingPool(
       explicit_buffer_bytes > 0 ? explicit_buffer_bytes : env_buffer_bytes;
   const size_t explicit_cpu_copy_threads =
       torch::aot_inductor::pinnedAsyncConstantsCopyCpuThreads();
-  // Staging is memory-bandwidth bound and the shared H2D stream already
-  // serializes copies across concurrently loading models, so more copy threads
-  // than the process may run on only adds contention.
+  // Staging is memory-bandwidth bound, so more copy threads than the process
+  // may run on only adds contention.
   size_t max_cpu_copy_threads = PinnedStagingPool::kMaxCpuCopyThreads;
   // hardware_concurrency() is allowed to return 0, and it reports the host
   // topology rather than the CPUs this process is confined to.
@@ -1258,8 +1320,20 @@ inline bool usePinnedAsyncConstantsCopy() {
     return setting == 1;
   }
 #ifdef USE_CUDA
+  // Only the env var is latched; setUsePinnedAsyncConstantsCopy() is checked
+  // above on every call and overrides it, including the ROCm default.
   static const bool enabled_from_env = [] {
     const char* env = std::getenv("AOTI_COPY_USE_PINNED_ASYNC");
+#ifdef USE_ROCM
+    // On by default on ROCm. A large pageable copy out of the .so's read-only
+    // constant pages makes ROCm try to pin those pages; on MI300X the pinning
+    // fails thousands of times per container and creating a container took
+    // 40-50 s instead of 0.5 s with the staged copy.
+    // AOTI_COPY_USE_PINNED_ASYNC=0 turns it off.
+    if (env == nullptr) {
+      return true;
+    }
+#endif
     return envFlagIsEnabled(env);
   }();
   return enabled_from_env;
@@ -1832,8 +1906,8 @@ class AOTInductorModelBase {
           .wait();
 #elif USE_CUDA
       // Prefer the pinned async staging path when the caller supplied a pool
-      // (AOTI_COPY_USE_PINNED_ASYNC). Otherwise fall back to the throttled
-      // synchronous copy (master default).
+      // (see usePinnedAsyncConstantsCopy()). Otherwise fall back to the
+      // throttled synchronous copy.
       if (staging_pool != nullptr) {
         staging_pool->copyH2DViaStage(
             internal_ptr, _get_constants_start() + bytes_read, data_size);

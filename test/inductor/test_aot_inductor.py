@@ -410,6 +410,36 @@ def profiled_ivalue_kinds(code, kernel_name):
     ]
 
 
+def _load_package_capturing_stderr(package_path):
+    """Loads an AOTI package and returns it with what the load wrote to fd 2."""
+    original_stderr_fd = os.dup(2)
+    with tempfile.TemporaryFile(mode="w+") as captured_stderr:
+        try:
+            os.dup2(captured_stderr.fileno(), 2)
+            loaded = torch._inductor.aoti_load_package(package_path)
+        finally:
+            os.dup2(original_stderr_fd, 2)
+            os.close(original_stderr_fd)
+        captured_stderr.seek(0)
+        return loaded, captured_stderr.read()
+
+
+def _compile_model_with_constants(device):
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(1025, 1025)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    example_inputs = (torch.randn(2, 1025, device=device),)
+    model = Model().to(device)
+    with config.patch({"always_keep_tensor_constants": True}):
+        package_path = AOTIRunnerUtil.compile(model, example_inputs)
+    return model, example_inputs, package_path
+
+
 class AOTInductorTestsTemplate:
     @common_utils.parametrize("embed_kernel_binary", [False, True])
     @common_utils.parametrize("max_autotune", [False, True])
@@ -740,16 +770,7 @@ class AOTInductorTestsTemplate:
         ):
             package_path = AOTIRunnerUtil.compile(model, example_inputs)
 
-        original_stderr_fd = os.dup(2)
-        with tempfile.TemporaryFile(mode="w+") as captured_stderr:
-            try:
-                os.dup2(captured_stderr.fileno(), 2)
-                optimized = torch._inductor.aoti_load_package(package_path)
-            finally:
-                os.dup2(original_stderr_fd, 2)
-                os.close(original_stderr_fd)
-            captured_stderr.seek(0)
-            loading_log = captured_stderr.read()
+        optimized, loading_log = _load_package_capturing_stderr(package_path)
 
         self.assertIn("copy_tasks=1 cpu_copy_threads=2", loading_log)
         self.assertRegex(
@@ -766,6 +787,46 @@ class AOTInductorTestsTemplate:
         # threshold regardless of constant emission order.
         self.assertGreaterEqual(parallel_windows, 1)
         self.assertGreater(task_count, parallel_windows)
+        self.assertEqual(optimized(*example_inputs), model(*example_inputs))
+
+    @unittest.skipIf(
+        not TEST_WITH_ROCM, "Pinned async constant copy is default-on only on ROCm"
+    )
+    @patch.dict(os.environ, {"AOTI_LOG_LOADING": "1"})
+    def test_constants_pinned_async_copy_default_on_rocm(self):
+        if self.device != "cuda":
+            raise unittest.SkipTest("requires a ROCm GPU")
+        os.environ.pop("AOTI_COPY_USE_PINNED_ASYNC", None)
+        model, example_inputs, package_path = _compile_model_with_constants(self.device)
+
+        loads = 3
+        for _ in range(loads):
+            optimized, loading_log = _load_package_capturing_stderr(package_path)
+            self.assertIn("PinnedStagingPool: allocated", loading_log)
+            self.assertEqual(optimized(*example_inputs), model(*example_inputs))
+            # Each pool owns a CU-masked stream and destroys it, so no load
+            # leaves a hardware queue behind.
+            self.assertEqual(
+                loading_log.count("PinnedStagingPool: created CU-masked H2D stream"),
+                loading_log.count("PinnedStagingPool: allocated"),
+            )
+            self.assertNotIn("created shared H2D stream", loading_log)
+            del optimized
+
+    @unittest.skipIf(
+        not TEST_WITH_ROCM, "Pinned async constant copy is default-on only on ROCm"
+    )
+    @patch.dict(
+        os.environ, {"AOTI_COPY_USE_PINNED_ASYNC": "0", "AOTI_LOG_LOADING": "1"}
+    )
+    def test_constants_pinned_async_copy_disabled_on_rocm(self):
+        if self.device != "cuda":
+            raise unittest.SkipTest("requires a ROCm GPU")
+        model, example_inputs, package_path = _compile_model_with_constants(self.device)
+
+        optimized, loading_log = _load_package_capturing_stderr(package_path)
+
+        self.assertNotIn("PinnedStagingPool: allocated", loading_log)
         self.assertEqual(optimized(*example_inputs), model(*example_inputs))
 
     def test_output_path_1(self):
